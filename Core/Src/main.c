@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "log.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -139,6 +140,14 @@ static void LED_EnterMode(void)
     else
         LED_Off();   /* 进入闪烁档时先熄灭，从暗开始闪，节奏更清楚 */
 }
+
+/* log.c 不认识串口：这里把「怎么把 n 个字节发出去」注入给它 */
+static void log_uart_write(const char *s, uint16_t n)
+{
+    /* 用带小超时的阻塞发送：n 最多 512，8MHz 下 512 字节约 450ms，
+       超时给到 1000ms 足够；这里不用阻塞大延时，只是等 UART 移位完 */
+    HAL_UART_Transmit(&huart1, (uint8_t *)s, n, 1000);
+}
 /* USER CODE END 0 */
 
 /**
@@ -173,6 +182,11 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   LED_GPIO_Init();
+
+  /* 日志库接上串口：注入发送函数、设运行期等级、打一条开机日志 */
+  log_init(log_uart_write);
+  log_set_level(LOG_DEBUG);
+  LOG_I('M', "boot, level=%d", (int)log_get_level());
   /* USER CODE END 2 */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -210,12 +224,8 @@ int main(void)
                   led_mode = (uint8_t)((led_mode + 1u) % 3u);
                   LED_EnterMode();
 
-                  HAL_UART_Transmit(&huart1, (uint8_t *)"MODE=", 5, 100);
-                  {
-                      uint8_t ch = (uint8_t)('0' + led_mode);
-                      HAL_UART_Transmit(&huart1, &ch, 1, 100);
-                  }
-                  HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 100);
+                  /* 只登记，不在这里发 —— 真正的发送交给循环末尾的 log_flush() */
+                  LOG_I('M', "MODE=%d", (int)led_mode);
               }
           }
       }
@@ -226,6 +236,9 @@ int main(void)
           led_last_tick = now;
           LED_Toggle();
       }
+
+      /* 3) 把日志库里攒的这一批送出去 */
+      log_flush();
 
     /* USER CODE END WHILE */
 
