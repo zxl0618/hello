@@ -56,7 +56,89 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* LED 三档模式：0=常亮，1=慢闪，2=快闪 */
+#define LED_MODE_ON   0
+#define LED_MODE_SLOW 1
+#define LED_MODE_FAST 2
 
+#define SLOW_PERIOD 1000u   /* 慢闪：1 秒翻转一次 */
+#define FAST_PERIOD 200u    /* 快闪：200 毫秒翻转一次 */
+
+#define DEBOUNCE_MS 20u     /* 按键去抖窗口：电平稳定多久才认 */
+
+/*
+ * 两颗灯同时控制，方便对照观察：
+ *   外接 LED：PA4 -- 68 欧电阻 -- LED 正极(长脚)，LED 负极(短脚) -- GND
+ *             PA4 输出高电平 -> 点亮
+ *   板载 LED：PC13，低电平点亮（板子上 PC13 和 LED 之间是灌电流接法）
+ *             所以两颗灯的电平逻辑正好相反
+ */
+#define LED_A_PORT   GPIOA
+#define LED_A_PIN    GPIO_PIN_4    /* 外接 LED，高电平亮 */
+
+#define LED_B_PORT   GPIOC
+#define LED_B_PIN    GPIO_PIN_13   /* 板载 LED，低电平亮 */
+
+static uint8_t  led_mode      = LED_MODE_ON;
+static uint32_t led_last_tick = 0;
+
+/* PA4 在 .ioc 里没配，这里手动初始化成推挽输出；PC13 已由 MX_GPIO_Init 配好 */
+static void LED_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin   = LED_A_PIN;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LED_A_PORT, &GPIO_InitStruct);
+
+    /* 上电先都熄灭 */
+    HAL_GPIO_WritePin(LED_A_PORT, LED_A_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_B_PORT, LED_B_PIN, GPIO_PIN_SET);
+}
+
+static void LED_On(void)
+{
+    HAL_GPIO_WritePin(LED_A_PORT, LED_A_PIN, GPIO_PIN_SET);    /* 外接：高电平亮 */
+    HAL_GPIO_WritePin(LED_B_PORT, LED_B_PIN, GPIO_PIN_RESET);  /* 板载：低电平亮 */
+}
+
+static void LED_Off(void)
+{
+    HAL_GPIO_WritePin(LED_A_PORT, LED_A_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_B_PORT, LED_B_PIN, GPIO_PIN_SET);
+}
+
+static void LED_Toggle(void)
+{
+    HAL_GPIO_TogglePin(LED_A_PORT, LED_A_PIN);
+    HAL_GPIO_TogglePin(LED_B_PORT, LED_B_PIN);
+}
+
+static void LED_Apply(void)
+{
+    /* 常亮档：保持点亮 */
+    if (led_mode == LED_MODE_ON)
+        LED_On();
+}
+
+static uint32_t LED_Period(void)
+{
+    return (led_mode == LED_MODE_FAST) ? FAST_PERIOD : SLOW_PERIOD;
+}
+
+/* 切换档位后调用：常亮档直接点亮，闪烁档交给主循环翻转 */
+static void LED_EnterMode(void)
+{
+    led_last_tick = HAL_GetTick();
+    if (led_mode == LED_MODE_ON)
+        LED_On();
+    else
+        LED_Off();   /* 进入闪烁档时先熄灭，从暗开始闪，节奏更清楚 */
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,22 +172,67 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  LED_GPIO_Init();
   /* USER CODE END 2 */
-
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  led_last_tick = HAL_GetTick();
+  LED_Apply();
+
   while (1)
   {
-      HAL_UART_Transmit(&huart1, (uint8_t *)"HELLO\r\n", 7, 100);
-      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-      HAL_Delay(1000);
-  }
+      uint32_t now = HAL_GetTick();
+
+      /* 1) 读按键：A0 接按键一端，按键另一端接 GND，内部上拉
+       *    松开 = GPIO_PIN_SET(1)，按下 = GPIO_PIN_RESET(0)
+       *    去抖：电平变化后要稳定超过 DEBOUNCE_MS 才认，避免一次按下跳好几档
+       */
+      {
+          static GPIO_PinState key_stable  = GPIO_PIN_SET;  /* 已确认的稳定电平 */
+          static GPIO_PinState key_last    = GPIO_PIN_SET;  /* 上一次采样到的电平 */
+          static uint32_t      key_tick    = 0;             /* 电平开始变化的时刻 */
+
+          GPIO_PinState key_now = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
+
+          if (key_now != key_last)
+          {
+              /* 电平刚发生变化，重新计时 */
+              key_last = key_now;
+              key_tick = now;
+          }
+          else if (key_now != key_stable && (now - key_tick >= DEBOUNCE_MS))
+          {
+              /* 新电平已经稳定超过窗口时间，认下来 */
+              key_stable = key_now;
+
+              if (key_stable == GPIO_PIN_RESET)   /* 按下沿：切档 */
+              {
+                  led_mode = (uint8_t)((led_mode + 1u) % 3u);
+                  LED_EnterMode();
+
+                  HAL_UART_Transmit(&huart1, (uint8_t *)"MODE=", 5, 100);
+                  {
+                      uint8_t ch = (uint8_t)('0' + led_mode);
+                      HAL_UART_Transmit(&huart1, &ch, 1, 100);
+                  }
+                  HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 100);
+              }
+          }
+      }
+
+      /* 2) 按当前档位的周期翻转 LED */
+      if (led_mode != LED_MODE_ON && (now - led_last_tick >= LED_Period()))
+      {
+          led_last_tick = now;
+          LED_Toggle();
+      }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
-
+}
 
 /**
   * @brief System Clock Configuration
@@ -202,6 +329,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : KEY_Pin */
+  GPIO_InitStruct.Pin = KEY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(KEY_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
